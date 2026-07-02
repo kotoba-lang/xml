@@ -167,3 +167,52 @@
         i (skip-non-element s 0)]
     (when (and (< i (count s)) (= \< (nth s i)))
       (first (parse-element s i)))))
+
+;; --- walking a parsed [:tag {"attr" "val"} child...] form ---
+;;
+;; The attrs map is OPTIONAL (only present when the element actually has
+;; attributes -- standard hiccup convention): [:a] and [:a {}] both mean
+;; "no attributes", and [:a [:b]] has :b as element[1] directly, with no
+;; attrs map in between. These helpers hide that so callers don't have to
+;; re-derive it at every call site.
+
+(defn el-tag [el]
+  (when (vector? el) (first el)))
+
+(defn el-attrs
+  "The element's attribute map, or {} when it has none."
+  [el]
+  (if (and (vector? el) (map? (second el))) (second el) {}))
+
+(defn el-attr [el k]
+  (get (el-attrs el) k))
+
+(defn el-children
+  "The element's child nodes (nested elements and/or text strings), never
+  including the attrs map itself."
+  [el]
+  (when (vector? el)
+    (vec (if (map? (second el)) (drop 2 el) (rest el)))))
+
+(defn el-elements
+  "Just the CHILD ELEMENTS (not text-node strings) among el's children."
+  [el]
+  (filterv vector? (el-children el)))
+
+(defn el-text
+  "All of el's direct text-node children, concatenated -- does NOT recurse
+  into child elements (mirrors how OOXML text runs are always direct
+  children of their <a:t>, never nested deeper)."
+  [el]
+  (apply str (filter string? (el-children el))))
+
+(defn find-all
+  "Every descendant element (at any depth, including el itself) whose tag
+  equals `tag`, in document order -- the direct EDN-tree equivalent of
+  regex-scanning for a tag anywhere in a block, but correct for same-tag
+  nesting (a group inside a group), which regex cannot delimit."
+  [el tag]
+  (when (vector? el)
+    (into (if (= tag (el-tag el)) [el] [])
+          (mapcat #(find-all % tag))
+          (el-elements el))))
