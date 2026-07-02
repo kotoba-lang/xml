@@ -216,3 +216,17 @@
     (into (if (= tag (el-tag el)) [el] [])
           (mapcat #(find-all % tag))
           (el-elements el))))
+
+(defn find-children
+  "el's DIRECT child elements whose tag equals `tag` -- unlike find-all,
+  never descends into grandchildren. Needed whenever a tag can legally
+  appear at more than one nesting depth (e.g. a group's own <a:xfrm> vs. a
+  descendant shape's <a:xfrm>), where find-all's any-depth search would
+  incorrectly match both."
+  [el tag]
+  (filterv #(= tag (el-tag %)) (el-elements el)))
+
+(defn find-child
+  "The first of el's DIRECT child elements whose tag equals `tag`, or nil."
+  [el tag]
+  (first (find-children el tag)))

@@ -115,6 +115,17 @@
   (testing "find-all on a non-matching tag returns empty, not nil"
     (is (= [] (parse/find-all (parse/parse "<a><b/></a>") :c)))))
 
+(deftest find-children-and-find-child-test
+  (testing "find-children only matches DIRECT children, never descendants at other depths -- unlike find-all"
+    (let [tree (parse/parse "<a><xfrm id=\"outer\"/><b><xfrm id=\"inner\"/></b></a>")]
+      (is (= [[:xfrm {"id" "outer"}]] (parse/find-children tree :xfrm))
+          "only the outer xfrm, a DIRECT child of <a> -- the one nested inside <b> is a grandchild, not found")
+      (is (= 2 (count (parse/find-all tree :xfrm)))
+          "find-all, by contrast, matches both regardless of depth")))
+  (testing "find-child returns just the first match, or nil"
+    (is (= [:b] (parse/find-child (parse/parse "<a><b/><b/></a>") :b)))
+    (is (nil? (parse/find-child (parse/parse "<a><b/></a>") :c)))))
+
 (deftest realistic-ooxml-fragment-test
   (testing "a representative <p:sp> shape fragment parses into a fully navigable EDN tree"
     (let [form (parse/parse
