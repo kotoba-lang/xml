@@ -1,0 +1,102 @@
+(ns xml.parse-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [xml.core :as xml]
+            [xml.parse :as parse]))
+
+(deftest basic-element-test
+  (testing "a self-closing tag with no attributes"
+    (is (= [:a] (parse/parse "<a/>")))
+    (is (= [:a] (parse/parse "<a />"))))
+  (testing "a paired tag with no attributes and no content"
+    (is (= [:a] (parse/parse "<a></a>"))))
+  (testing "a tag with text content"
+    (is (= [:a "hello"] (parse/parse "<a>hello</a>")))))
+
+(deftest attributes-test
+  (testing "double-quoted attributes"
+    (is (= [:a {"id" "2" "name" "Title"}] (parse/parse "<a id=\"2\" name=\"Title\"/>"))))
+  (testing "single-quoted attributes"
+    (is (= [:a {"id" "2"}] (parse/parse "<a id='2'/>"))))
+  (testing "a namespace-prefixed attribute name is kept verbatim (not split)"
+    (is (= [:a {"r:embed" "rId5"}] (parse/parse "<a r:embed=\"rId5\"/>")))))
+
+(deftest namespaced-tag-test
+  (testing "a prefixed tag name becomes a namespaced keyword (prefix as namespace, local name as name)"
+    (is (= [:p/sp] (parse/parse "<p:sp/>")))
+    (is (= "sp" (name (first (parse/parse "<p:sp/>")))))
+    (is (= "p" (namespace (first (parse/parse "<p:sp/>"))))))
+  (testing "an unprefixed tag name becomes a plain (non-namespaced) keyword"
+    (is (= [:workbook] (parse/parse "<workbook/>")))))
+
+(deftest nested-elements-test
+  (testing "ordinary parent/child nesting"
+    (is (= [:a [:b] [:c "text"]] (parse/parse "<a><b/><c>text</c></a>"))))
+  (testing "SAME-TAG nesting (a group inside a group) -- the exact case regex-based scanning\n           in kotoba-lang/drawingml needed a hand-rolled stack-based scanner for"
+    (is (= [:p/grpSp {"id" "outer"}
+            [:p/sp "outer child"]
+            [:p/grpSp {"id" "inner"}
+             [:p/sp "inner child"]]]
+           (parse/parse
+            (str "<p:grpSp id=\"outer\">"
+                 "<p:sp>outer child</p:sp>"
+                 "<p:grpSp id=\"inner\"><p:sp>inner child</p:sp></p:grpSp>"
+                 "</p:grpSp>")))))
+  (testing "three levels deep, mixed self-closing and paired"
+    (is (= [:a [:b [:c [:d]]]]
+           (parse/parse "<a><b><c><d/></c></b></a>")))))
+
+(deftest text-and-entities-test
+  (testing "named entities decode"
+    (is (= [:a "<tag> & \"quoted\" 'text'"]
+           (parse/parse "<a>&lt;tag&gt; &amp; &quot;quoted&quot; &apos;text&apos;</a>"))))
+  (testing "numeric character references (decimal and hex) decode -- the bullet-char case real OOXML uses"
+    (is (= [:a "•"] (parse/parse "<a>&#8226;</a>")))
+    (is (= [:a "•"] (parse/parse "<a>&#x2022;</a>"))))
+  (testing "attribute values also get entity-decoded"
+    (is (= [:a {"label" "A & B"}] (parse/parse "<a label=\"A &amp; B\"/>"))))
+  (testing "an unescaped '>' inside a quoted attribute value doesn't truncate the tag early (XML technically allows this, unlike '<'/'&')"
+    (is (= [:a {"fmla" "a > b"} [:b]] (parse/parse "<a fmla=\"a > b\"><b/></a>"))))
+  (testing "mixed text and child elements -- both text nodes and elements appear as children in document order"
+    (is (= [:a "before" [:b] "after"] (parse/parse "<a>before<b/>after</a>"))))
+  (testing "whitespace-only text between elements is dropped (matches how real-world pretty-printed OOXML shouldn't spuriously produce empty text-node children)"
+    (is (= [:a [:b] [:c]] (parse/parse "<a>\n  <b/>\n  <c/>\n</a>")))))
+
+(deftest cdata-and-comments-test
+  (testing "CDATA decodes to plain text, un-escaped"
+    (is (= [:a "<raw> & stuff"] (parse/parse "<a><![CDATA[<raw> & stuff]]></a>"))))
+  (testing "comments are skipped entirely, not surfaced as children"
+    (is (= [:a [:b]] (parse/parse "<a><!-- a comment --><b/></a>")))))
+
+(deftest prolog-and-whitespace-test
+  (testing "an XML declaration is skipped"
+    (is (= [:a] (parse/parse "<?xml version=\"1.0\" encoding=\"UTF-8\"?><a/>"))))
+  (testing "leading whitespace before the root element is skipped"
+    (is (= [:a] (parse/parse "\n  <a/>"))))
+  (testing "a DOCTYPE declaration is skipped"
+    (is (= [:a] (parse/parse "<!DOCTYPE a><a/>")))))
+
+(deftest blank-input-test
+  (is (nil? (parse/parse "")))
+  (is (nil? (parse/parse "   \n  "))))
+
+(deftest round-trip-through-xml-core-test
+  (testing "parse then re-emit via xml.core produces an equivalent tree when reparsed (whitespace/indentation differs, structure doesn't)"
+    (let [original [:p/sldLayout {"type" "blank"} [:p/cSld [:p/spTree]]]
+          re-parsed (parse/parse (xml/xml original))]
+      (is (= original re-parsed)))))
+
+(deftest realistic-ooxml-fragment-test
+  (testing "a representative <p:sp> shape fragment parses into a fully navigable EDN tree"
+    (let [form (parse/parse
+                (str "<p:sp><p:spPr><a:prstGeom prst=\"roundRect\"><a:avLst>"
+                     "<a:gd name=\"adj\" fmla=\"val 16667\"/></a:avLst></a:prstGeom>"
+                     "<a:solidFill><a:srgbClr val=\"445566\"/></a:solidFill>"
+                     "</p:spPr><p:txBody><a:p><a:r><a:t>Hello</a:t></a:r></a:p></p:txBody></p:sp>"))]
+      (is (= :p/sp (first form)))
+      (let [[_ spPr txBody] form
+            [_ prstGeom solidFill] spPr]
+        (is (= :p/spPr (first spPr)))
+        (is (= "roundRect" (get (second prstGeom) "prst")))
+        (is (= [:a/gd {"name" "adj" "fmla" "val 16667"}] (get-in prstGeom [2 1])))
+        (is (= "445566" (get-in solidFill [1 1 "val"])))
+        (is (= "Hello" (get-in txBody [1 1 1 1])))))))

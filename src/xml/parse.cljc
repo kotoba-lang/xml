@@ -1,0 +1,169 @@
+(ns xml.parse
+  "Zero-dependency XML string -> hiccup-shaped EDN parser: [:tag {\"attr\"
+  \"val\" ...} child ...], where each child is either a nested element
+  vector or a plain string (a text node; CDATA sections decode to plain
+  text the same way). Prefixed tag names (<p:sp>, <a:xfrm>) become
+  NAMESPACED keywords (:p/sp, :a/xfrm) using the XML prefix as the
+  keyword's namespace and the local name as its name -- Clojure's own
+  prefix/name split maps directly onto XML's. Attribute names stay plain
+  strings (an attribute can appear with or without a prefix inconsistently
+  across real documents, and callers look attributes up by their exact
+  string name, e.g. \"r:id\").
+
+  Complements xml.core's hiccup -> XML direction: together they round-trip
+  a document through plain EDN data that can be walked/queried/transformed
+  with ordinary Clojure functions, instead of ad-hoc regex scanning against
+  raw XML text.
+
+  Not a fully spec-compliant XML parser (no DTD/entity-declaration
+  processing, no namespace URI resolution -- only the prefix syntax), but
+  handles everything real-world OOXML/office-XML documents actually use:
+  nested elements at arbitrary depth, self-closing tags, single/double-
+  quoted attributes, text content, CDATA sections, comments, the XML
+  declaration, and the five standard entities plus numeric character
+  references."
+  (:require [clojure.string :as str]))
+
+(defn- parse-int-radix [s radix]
+  #?(:clj (Integer/parseInt s radix)
+     :cljs (js/parseInt s radix)))
+
+(defn- codepoint-string [n]
+  #?(:clj (String. (Character/toChars n))
+     :cljs (.fromCodePoint js/String n)))
+
+(defn- decode-numeric-entity [[raw hex dec]]
+  (try
+    (codepoint-string (if hex (parse-int-radix hex 16) (parse-int-radix dec 10)))
+    (catch #?(:clj Exception :cljs :default) _
+      raw)))
+
+(defn unescape
+  "&#8226;/&#x2022;/&amp;/&lt;/&gt;/&quot;/&apos; -> their literal
+  characters."
+  [s]
+  (-> (str (or s ""))
+      (str/replace #"&#x([0-9A-Fa-f]+);|&#([0-9]+);" decode-numeric-entity)
+      (str/replace "&lt;" "<")
+      (str/replace "&gt;" ">")
+      (str/replace "&quot;" "\"")
+      (str/replace "&apos;" "'")
+      (str/replace "&amp;" "&")))
+
+(defn- tag-keyword [nm]
+  (let [i (str/index-of nm ":")]
+    (if i
+      (keyword (subs nm 0 i) (subs nm (inc i)))
+      (keyword nm))))
+
+(def ^:private whitespace-chars #{\space \tab \newline \return})
+
+(defn- whitespace-char? [c] (contains? whitespace-chars c))
+
+(defn- name-end [s]
+  (loop [j 0]
+    (if (and (< j (count s)) (not (whitespace-char? (nth s j))))
+      (recur (inc j))
+      j)))
+
+(defn- parse-attrs-str [s]
+  (into {}
+        (map (fn [[_ k v1 v2]] [k (unescape (or v1 v2))]))
+        (re-seq #"([^\s=/>]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')" (or s ""))))
+
+(defn- idx-or-end [s sub from n]
+  (or (str/index-of s sub from) n))
+
+(defn- skip-non-element
+  "From index i, skips any run of whitespace, the XML declaration
+  (<?...?>), comments (<!--...-->), and DOCTYPE (<!...>) -- everything
+  that can legally precede/separate the document's root element -- and
+  returns the index of the next significant character."
+  [s i]
+  (let [n (count s)]
+    (loop [i i]
+      (cond
+        (>= i n) i
+        (whitespace-char? (nth s i)) (recur (inc i))
+        (and (< (inc i) n) (= \< (nth s i)) (= \? (nth s (inc i))))
+        (recur (+ (idx-or-end s "?>" i n) 2))
+        (and (<= (+ i 4) n) (= "<!--" (subs s i (+ i 4))))
+        (recur (+ (idx-or-end s "-->" (+ i 4) n) 3))
+        (and (<= (+ i 2) n) (= "<!" (subs s i (+ i 2))))
+        (recur (inc (idx-or-end s ">" i n)))
+        :else i))))
+
+(defn- find-tag-close
+  "The index of the '>' that closes an opening/self-closing tag starting
+  at s[i] (s[i] = '<'), correctly skipping over '>' characters that appear
+  inside a quoted attribute value -- XML technically allows an unescaped
+  '>' there (unlike '<' and '&', which MUST be escaped), so a naive
+  first-'>' search would truncate a tag early on e.g. fmla=\"a > b\"."
+  [s i n]
+  (loop [j (inc i) quote-char nil]
+    (cond
+      (>= j n) j
+      quote-char (recur (inc j) (when-not (= quote-char (nth s j)) quote-char))
+      (or (= \" (nth s j)) (= \' (nth s j))) (recur (inc j) (nth s j))
+      (= \> (nth s j)) j
+      :else (recur (inc j) quote-char))))
+
+(declare parse-element)
+
+(defn- parse-content
+  "Parses element content starting right after the opening tag's '>' up to
+  (but not including) the matching '</tag>'. Returns [children next-index]
+  where next-index points at the '<' of that closing tag."
+  [s i]
+  (let [n (count s)]
+    (loop [i i children []]
+      (cond
+        (>= i n) [children i]
+
+        (and (<= (+ i 9) n) (= "<![CDATA[" (subs s i (+ i 9))))
+        (let [end (idx-or-end s "]]>" (+ i 9) n)]
+          (recur (+ end 3) (conj children (subs s (+ i 9) end))))
+
+        (and (<= (+ i 4) n) (= "<!--" (subs s i (+ i 4))))
+        (recur (+ (idx-or-end s "-->" (+ i 4) n) 3) children)
+
+        (and (<= (+ i 2) n) (= "</" (subs s i (+ i 2))))
+        [children i]
+
+        (= \< (nth s i))
+        (let [[el next-i] (parse-element s i)]
+          (recur next-i (conj children el)))
+
+        :else
+        (let [next-lt (idx-or-end s "<" i n)
+              text (unescape (subs s i next-lt))]
+          (recur next-lt (if (str/blank? text) children (conj children text))))))))
+
+(defn- parse-element
+  "Parses one element starting at index i (s[i] = the element's opening
+  '<'). Returns [hiccup-form next-index] where next-index is right after
+  the closing '>' of either the self-closing tag or the matching end tag."
+  [s i]
+  (let [n (count s)
+        gt (find-tag-close s i n)
+        self-close? (and (pos? gt) (= \/ (nth s (dec gt))))
+        tag-body (subs s (inc i) (if self-close? (dec gt) gt))
+        ne (name-end tag-body)
+        tag-name (subs tag-body 0 ne)
+        attrs (parse-attrs-str (subs tag-body ne))
+        base (if (seq attrs) [(tag-keyword tag-name) attrs] [(tag-keyword tag-name)])]
+    (if self-close?
+      [base (inc gt)]
+      (let [[children content-end] (parse-content s (inc gt))
+            close-gt (idx-or-end s ">" content-end n)]
+        [(into base children) (inc close-gt)]))))
+
+(defn parse
+  "Parses an XML document string into a single hiccup-shaped EDN form for
+  its root element. nil for a blank/whitespace-only or otherwise
+  element-less input."
+  [xml-str]
+  (let [s (str xml-str)
+        i (skip-non-element s 0)]
+    (when (and (< i (count s)) (= \< (nth s i)))
+      (first (parse-element s i)))))
