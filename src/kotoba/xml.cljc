@@ -14,3 +14,5 @@
 (def el-elements parse/el-elements)
 (def el-text parse/el-text)
 (def find-all parse/find-all)
+(def find-children parse/find-children)
+(def find-child parse/find-child)
