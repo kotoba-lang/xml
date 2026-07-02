@@ -85,6 +85,36 @@
           re-parsed (parse/parse (xml/xml original))]
       (is (= original re-parsed)))))
 
+(deftest hiccup-walking-helpers-test
+  (let [tree (parse/parse "<a x=\"1\"><b/><c y=\"2\">text</c><b>again</b></a>")]
+    (testing "el-tag/el-attrs/el-attr"
+      (is (= :a (parse/el-tag tree)))
+      (is (= {"x" "1"} (parse/el-attrs tree)))
+      (is (= "1" (parse/el-attr tree "x")))
+      (is (= {} (parse/el-attrs [:b])))
+      (is (nil? (parse/el-attr [:b] "missing"))))
+    (testing "el-children includes both elements and text, never the attrs map itself"
+      (is (= [[:b] [:c {"y" "2"} "text"] [:b "again"]] (parse/el-children tree))))
+    (testing "el-elements filters out text-node children"
+      (let [mixed (parse/parse "<a>before<b/>after</a>")]
+        (is (= [[:b]] (parse/el-elements mixed)))))
+    (testing "el-text concatenates direct text children only (no recursion into child elements)"
+      (is (= "text" (parse/el-text (nth (parse/el-elements tree) 1))))
+      (is (= "" (parse/el-text tree)) "a has no DIRECT text children, only element children")))
+  (testing "find-all finds a tag at any depth, correctly handling same-tag nesting"
+    (let [tree (parse/parse
+                (str "<p:grpSp id=\"outer\">"
+                     "<p:sp/>"
+                     "<p:grpSp id=\"inner\"><p:sp/></p:grpSp>"
+                     "</p:grpSp>"))
+          groups (parse/find-all tree :p/grpSp)]
+      (is (= 2 (count groups)))
+      (is (= "outer" (parse/el-attr (first groups) "id")))
+      (is (= "inner" (parse/el-attr (second groups) "id")))
+      (is (= 2 (count (parse/find-all tree :p/sp))))))
+  (testing "find-all on a non-matching tag returns empty, not nil"
+    (is (= [] (parse/find-all (parse/parse "<a><b/></a>") :c)))))
+
 (deftest realistic-ooxml-fragment-test
   (testing "a representative <p:sp> shape fragment parses into a fully navigable EDN tree"
     (let [form (parse/parse
